@@ -38,8 +38,6 @@
 
 #include <stdint.h>
 
-/* clang-format off */
-
 enum EPOLL_EVENTS {
   EPOLLIN      = (int) (1U <<  0),
   EPOLLPRI     = (int) (1U <<  1),
@@ -71,8 +69,6 @@ enum EPOLL_EVENTS {
 #define EPOLL_CTL_ADD 1
 #define EPOLL_CTL_MOD 2
 #define EPOLL_CTL_DEL 3
-
-/* clang-format on */
 
 typedef void* HANDLE;
 typedef uintptr_t SOCKET;
