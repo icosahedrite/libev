@@ -107,7 +107,8 @@ WEPOLL_EXPORT int epoll_wait(HANDLE ephnd,
 } /* extern "C" */
 #endif
 
-#include <malloc.h>
+#include <assert.h>
+
 #include <stdlib.h>
 
 #define WEPOLL_INTERNAL static
@@ -165,6 +166,10 @@ typedef NTSTATUS* PNTSTATUS;
 #define STATUS_CANCELLED ((NTSTATUS) 0xC0000120L)
 #endif
 
+#ifndef STATUS_NOT_FOUND
+#define STATUS_NOT_FOUND ((NTSTATUS) 0xC0000225L)
+#endif
+
 typedef struct _IO_STATUS_BLOCK {
   NTSTATUS Status;
   ULONG_PTR Information;
@@ -205,6 +210,13 @@ typedef struct _OBJECT_ATTRIBUTES {
   (STANDARD_RIGHTS_REQUIRED | KEYEDEVENT_WAIT | KEYEDEVENT_WAKE)
 
 #define NT_NTDLL_IMPORT_LIST(X)           \
+  X(NTSTATUS,                             \
+    NTAPI,                                \
+    NtCancelIoFileEx,                     \
+    (HANDLE FileHandle,                   \
+     PIO_STATUS_BLOCK IoRequestToCancel,  \
+     PIO_STATUS_BLOCK IoStatusBlock))     \
+                                          \
   X(NTSTATUS,                             \
     NTAPI,                                \
     NtCreateFile,                         \
@@ -265,25 +277,6 @@ typedef struct _OBJECT_ATTRIBUTES {
 NT_NTDLL_IMPORT_LIST(X)
 #undef X
 
-#include <assert.h>
-#include <stddef.h>
-
-#ifndef _SSIZE_T_DEFINED
-typedef intptr_t ssize_t;
-#endif
-
-#define array_count(a) (sizeof(a) / (sizeof((a)[0])))
-
-#define container_of(ptr, type, member) \
-  ((type*) ((uintptr_t) (ptr) - offsetof(type, member)))
-
-#define unused_var(v) ((void) (v))
-
-/* Polyfill `inline` for older versions of msvc (up to Visual Studio 2013) */
-#if defined(_MSC_VER) && _MSC_VER < 1900
-#define inline __inline
-#endif
-
 #define AFD_POLL_RECEIVE           0x0001
 #define AFD_POLL_RECEIVE_EXPEDITED 0x0002
 #define AFD_POLL_SEND              0x0004
@@ -311,7 +304,9 @@ WEPOLL_INTERNAL int afd_create_helper_handle(HANDLE iocp_handle,
 
 WEPOLL_INTERNAL int afd_poll(HANDLE afd_helper_handle,
                              AFD_POLL_INFO* poll_info,
-                             OVERLAPPED* overlapped);
+                             IO_STATUS_BLOCK* io_status_block);
+WEPOLL_INTERNAL int afd_cancel_poll(HANDLE afd_helper_handle,
+                                    IO_STATUS_BLOCK* io_status_block);
 
 #define return_map_error(value) \
   do {                          \
@@ -328,9 +323,6 @@ WEPOLL_INTERNAL int afd_poll(HANDLE afd_helper_handle,
 WEPOLL_INTERNAL void err_map_win_error(void);
 WEPOLL_INTERNAL void err_set_win_error(DWORD error);
 WEPOLL_INTERNAL int err_check_handle(HANDLE handle);
-
-WEPOLL_INTERNAL int ws_global_init(void);
-WEPOLL_INTERNAL SOCKET ws_get_base_socket(SOCKET socket);
 
 #define IOCTL_AFD_POLL 0x00012024
 
@@ -380,33 +372,18 @@ error:
 
 int afd_poll(HANDLE afd_helper_handle,
              AFD_POLL_INFO* poll_info,
-             OVERLAPPED* overlapped) {
-  IO_STATUS_BLOCK* iosb;
-  HANDLE event;
-  void* apc_context;
+             IO_STATUS_BLOCK* io_status_block) {
   NTSTATUS status;
 
   /* Blocking operation is not supported. */
-  assert(overlapped != NULL);
+  assert(io_status_block != NULL);
 
-  iosb = (IO_STATUS_BLOCK*) &overlapped->Internal;
-  event = overlapped->hEvent;
-
-  /* Do what other windows APIs would do: if hEvent has it's lowest bit set,
-   * don't post a completion to the completion port. */
-  if ((uintptr_t) event & 1) {
-    event = (HANDLE)((uintptr_t) event & ~(uintptr_t) 1);
-    apc_context = NULL;
-  } else {
-    apc_context = overlapped;
-  }
-
-  iosb->Status = STATUS_PENDING;
+  io_status_block->Status = STATUS_PENDING;
   status = NtDeviceIoControlFile(afd_helper_handle,
-                                 event,
                                  NULL,
-                                 apc_context,
-                                 iosb,
+                                 NULL,
+                                 io_status_block,
+                                 io_status_block,
                                  IOCTL_AFD_POLL,
                                  poll_info,
                                  sizeof *poll_info,
@@ -421,163 +398,35 @@ int afd_poll(HANDLE afd_helper_handle,
     return_set_error(-1, RtlNtStatusToDosError(status));
 }
 
+int afd_cancel_poll(HANDLE afd_helper_handle,
+                    IO_STATUS_BLOCK* io_status_block) {
+  NTSTATUS cancel_status;
+  IO_STATUS_BLOCK cancel_iosb;
+
+  /* If the poll operation has already completed or has been cancelled earlier,
+   * there's nothing left for us to do. */
+  if (io_status_block->Status != STATUS_PENDING)
+    return 0;
+
+  cancel_status =
+      NtCancelIoFileEx(afd_helper_handle, io_status_block, &cancel_iosb);
+
+  /* NtCancelIoFileEx() may return STATUS_NOT_FOUND if the operation completed
+   * just before calling NtCancelIoFileEx(). This is not an error. */
+  if (cancel_status == STATUS_SUCCESS || cancel_status == STATUS_NOT_FOUND)
+    return 0;
+  else
+    return_set_error(-1, RtlNtStatusToDosError(cancel_status));
+}
+
 WEPOLL_INTERNAL int epoll_global_init(void);
 
 WEPOLL_INTERNAL int init(void);
 
-#include <stdbool.h>
-
-typedef struct queue_node queue_node_t;
-
-typedef struct queue_node {
-  queue_node_t* prev;
-  queue_node_t* next;
-} queue_node_t;
-
-typedef struct queue {
-  queue_node_t head;
-} queue_t;
-
-WEPOLL_INTERNAL void queue_init(queue_t* queue);
-WEPOLL_INTERNAL void queue_node_init(queue_node_t* node);
-
-WEPOLL_INTERNAL queue_node_t* queue_first(const queue_t* queue);
-WEPOLL_INTERNAL queue_node_t* queue_last(const queue_t* queue);
-
-WEPOLL_INTERNAL void queue_prepend(queue_t* queue, queue_node_t* node);
-WEPOLL_INTERNAL void queue_append(queue_t* queue, queue_node_t* node);
-WEPOLL_INTERNAL void queue_move_first(queue_t* queue, queue_node_t* node);
-WEPOLL_INTERNAL void queue_move_last(queue_t* queue, queue_node_t* node);
-WEPOLL_INTERNAL void queue_remove(queue_node_t* node);
-
-WEPOLL_INTERNAL bool queue_empty(const queue_t* queue);
-WEPOLL_INTERNAL bool queue_enqueued(const queue_node_t* node);
-
 typedef struct port_state port_state_t;
-typedef struct poll_group poll_group_t;
-
-WEPOLL_INTERNAL poll_group_t* poll_group_acquire(port_state_t* port);
-WEPOLL_INTERNAL void poll_group_release(poll_group_t* poll_group);
-
-WEPOLL_INTERNAL void poll_group_delete(poll_group_t* poll_group);
-
-WEPOLL_INTERNAL poll_group_t* poll_group_from_queue_node(
-    queue_node_t* queue_node);
-WEPOLL_INTERNAL HANDLE
-    poll_group_get_afd_helper_handle(poll_group_t* poll_group);
-
-/* N.b.: the tree functions do not set errno or LastError when they fail. Each
- * of the API functions has at most one failure mode. It is up to the caller to
- * set an appropriate error code when necessary. */
-
-typedef struct tree tree_t;
-typedef struct tree_node tree_node_t;
-
-typedef struct tree {
-  tree_node_t* root;
-} tree_t;
-
-typedef struct tree_node {
-  tree_node_t* left;
-  tree_node_t* right;
-  tree_node_t* parent;
-  uintptr_t key;
-  bool red;
-} tree_node_t;
-
-WEPOLL_INTERNAL void tree_init(tree_t* tree);
-WEPOLL_INTERNAL void tree_node_init(tree_node_t* node);
-
-WEPOLL_INTERNAL int tree_add(tree_t* tree, tree_node_t* node, uintptr_t key);
-WEPOLL_INTERNAL void tree_del(tree_t* tree, tree_node_t* node);
-
-WEPOLL_INTERNAL tree_node_t* tree_find(const tree_t* tree, uintptr_t key);
-WEPOLL_INTERNAL tree_node_t* tree_root(const tree_t* tree);
-
-typedef struct port_state port_state_t;
+typedef struct queue queue_t;
 typedef struct sock_state sock_state_t;
-
-WEPOLL_INTERNAL sock_state_t* sock_new(port_state_t* port_state,
-                                       SOCKET socket);
-WEPOLL_INTERNAL void sock_delete(port_state_t* port_state,
-                                 sock_state_t* sock_state);
-WEPOLL_INTERNAL void sock_force_delete(port_state_t* port_state,
-                                       sock_state_t* sock_state);
-
-WEPOLL_INTERNAL int sock_set_event(port_state_t* port_state,
-                                   sock_state_t* sock_state,
-                                   const struct epoll_event* ev);
-
-WEPOLL_INTERNAL int sock_update(port_state_t* port_state,
-                                sock_state_t* sock_state);
-WEPOLL_INTERNAL int sock_feed_event(port_state_t* port_state,
-                                    OVERLAPPED* overlapped,
-                                    struct epoll_event* ev);
-
-WEPOLL_INTERNAL sock_state_t* sock_state_from_queue_node(
-    queue_node_t* queue_node);
-WEPOLL_INTERNAL queue_node_t* sock_state_to_queue_node(
-    sock_state_t* sock_state);
-WEPOLL_INTERNAL sock_state_t* sock_state_from_tree_node(
-    tree_node_t* tree_node);
-WEPOLL_INTERNAL tree_node_t* sock_state_to_tree_node(sock_state_t* sock_state);
-
-/* The reflock is a special kind of lock that normally prevents a chunk of
- * memory from being freed, but does allow the chunk of memory to eventually be
- * released in a coordinated fashion.
- *
- * Under normal operation, threads increase and decrease the reference count,
- * which are wait-free operations.
- *
- * Exactly once during the reflock's lifecycle, a thread holding a reference to
- * the lock may "destroy" the lock; this operation blocks until all other
- * threads holding a reference to the lock have dereferenced it. After
- * "destroy" returns, the calling thread may assume that no other threads have
- * a reference to the lock.
- *
- * Attemmpting to lock or destroy a lock after reflock_unref_and_destroy() has
- * been called is invalid and results in undefined behavior. Therefore the user
- * should use another lock to guarantee that this can't happen.
- */
-
-typedef struct reflock {
-  volatile long state; /* 32-bit Interlocked APIs operate on `long` values. */
-} reflock_t;
-
-WEPOLL_INTERNAL int reflock_global_init(void);
-
-WEPOLL_INTERNAL void reflock_init(reflock_t* reflock);
-WEPOLL_INTERNAL void reflock_ref(reflock_t* reflock);
-WEPOLL_INTERNAL void reflock_unref(reflock_t* reflock);
-WEPOLL_INTERNAL void reflock_unref_and_destroy(reflock_t* reflock);
-
-typedef struct ts_tree {
-  tree_t tree;
-  SRWLOCK lock;
-} ts_tree_t;
-
-typedef struct ts_tree_node {
-  tree_node_t tree_node;
-  reflock_t reflock;
-} ts_tree_node_t;
-
-WEPOLL_INTERNAL void ts_tree_init(ts_tree_t* rtl);
-WEPOLL_INTERNAL void ts_tree_node_init(ts_tree_node_t* node);
-
-WEPOLL_INTERNAL int ts_tree_add(ts_tree_t* ts_tree,
-                                ts_tree_node_t* node,
-                                uintptr_t key);
-
-WEPOLL_INTERNAL ts_tree_node_t* ts_tree_del_and_ref(ts_tree_t* ts_tree,
-                                                    uintptr_t key);
-WEPOLL_INTERNAL ts_tree_node_t* ts_tree_find_and_ref(ts_tree_t* ts_tree,
-                                                     uintptr_t key);
-
-WEPOLL_INTERNAL void ts_tree_node_unref(ts_tree_node_t* node);
-WEPOLL_INTERNAL void ts_tree_node_unref_and_destroy(ts_tree_node_t* node);
-
-typedef struct port_state port_state_t;
-typedef struct sock_state sock_state_t;
+typedef struct ts_tree_node ts_tree_node_t;
 
 WEPOLL_INTERNAL port_state_t* port_new(HANDLE* iocp_handle_out);
 WEPOLL_INTERNAL int port_close(port_state_t* port_state);
@@ -618,6 +467,90 @@ WEPOLL_INTERNAL port_state_t* port_state_from_handle_tree_node(
     ts_tree_node_t* tree_node);
 WEPOLL_INTERNAL ts_tree_node_t* port_state_to_handle_tree_node(
     port_state_t* port_state);
+
+/* The reflock is a special kind of lock that normally prevents a chunk of
+ * memory from being freed, but does allow the chunk of memory to eventually be
+ * released in a coordinated fashion.
+ *
+ * Under normal operation, threads increase and decrease the reference count,
+ * which are wait-free operations.
+ *
+ * Exactly once during the reflock's lifecycle, a thread holding a reference to
+ * the lock may "destroy" the lock; this operation blocks until all other
+ * threads holding a reference to the lock have dereferenced it. After
+ * "destroy" returns, the calling thread may assume that no other threads have
+ * a reference to the lock.
+ *
+ * Attemmpting to lock or destroy a lock after reflock_unref_and_destroy() has
+ * been called is invalid and results in undefined behavior. Therefore the user
+ * should use another lock to guarantee that this can't happen.
+ */
+
+typedef struct reflock {
+  volatile long state; /* 32-bit Interlocked APIs operate on `long` values. */
+} reflock_t;
+
+WEPOLL_INTERNAL int reflock_global_init(void);
+
+WEPOLL_INTERNAL void reflock_init(reflock_t* reflock);
+WEPOLL_INTERNAL void reflock_ref(reflock_t* reflock);
+WEPOLL_INTERNAL void reflock_unref(reflock_t* reflock);
+WEPOLL_INTERNAL void reflock_unref_and_destroy(reflock_t* reflock);
+
+#include <stdbool.h>
+
+/* N.b.: the tree functions do not set errno or LastError when they fail. Each
+ * of the API functions has at most one failure mode. It is up to the caller to
+ * set an appropriate error code when necessary. */
+
+typedef struct tree tree_t;
+typedef struct tree_node tree_node_t;
+
+typedef struct tree {
+  tree_node_t* root;
+} tree_t;
+
+typedef struct tree_node {
+  tree_node_t* left;
+  tree_node_t* right;
+  tree_node_t* parent;
+  uintptr_t key;
+  bool red;
+} tree_node_t;
+
+WEPOLL_INTERNAL void tree_init(tree_t* tree);
+WEPOLL_INTERNAL void tree_node_init(tree_node_t* node);
+
+WEPOLL_INTERNAL int tree_add(tree_t* tree, tree_node_t* node, uintptr_t key);
+WEPOLL_INTERNAL void tree_del(tree_t* tree, tree_node_t* node);
+
+WEPOLL_INTERNAL tree_node_t* tree_find(const tree_t* tree, uintptr_t key);
+WEPOLL_INTERNAL tree_node_t* tree_root(const tree_t* tree);
+
+typedef struct ts_tree {
+  tree_t tree;
+  SRWLOCK lock;
+} ts_tree_t;
+
+typedef struct ts_tree_node {
+  tree_node_t tree_node;
+  reflock_t reflock;
+} ts_tree_node_t;
+
+WEPOLL_INTERNAL void ts_tree_init(ts_tree_t* rtl);
+WEPOLL_INTERNAL void ts_tree_node_init(ts_tree_node_t* node);
+
+WEPOLL_INTERNAL int ts_tree_add(ts_tree_t* ts_tree,
+                                ts_tree_node_t* node,
+                                uintptr_t key);
+
+WEPOLL_INTERNAL ts_tree_node_t* ts_tree_del_and_ref(ts_tree_t* ts_tree,
+                                                    uintptr_t key);
+WEPOLL_INTERNAL ts_tree_node_t* ts_tree_find_and_ref(ts_tree_t* ts_tree,
+                                                     uintptr_t key);
+
+WEPOLL_INTERNAL void ts_tree_node_unref(ts_tree_node_t* node);
+WEPOLL_INTERNAL void ts_tree_node_unref_and_destroy(ts_tree_node_t* node);
 
 static ts_tree_t epoll__handle_tree;
 
@@ -893,6 +826,23 @@ int err_check_handle(HANDLE handle) {
   return 0;
 }
 
+#include <stddef.h>
+
+#define array_count(a) (sizeof(a) / (sizeof((a)[0])))
+
+#define container_of(ptr, type, member) \
+  ((type*) ((uintptr_t) (ptr) - offsetof(type, member)))
+
+#define unused_var(v) ((void) (v))
+
+/* Polyfill `inline` for older versions of msvc (up to Visual Studio 2013) */
+#if defined(_MSC_VER) && _MSC_VER < 1900
+#define inline __inline
+#endif
+
+WEPOLL_INTERNAL int ws_global_init(void);
+WEPOLL_INTERNAL SOCKET ws_get_base_socket(SOCKET socket);
+
 static bool init__done = false;
 static INIT_ONCE init__once = INIT_ONCE_STATIC_INIT;
 
@@ -961,6 +911,44 @@ int nt_global_init(void) {
 }
 
 #include <string.h>
+
+typedef struct poll_group poll_group_t;
+
+typedef struct queue_node queue_node_t;
+
+WEPOLL_INTERNAL poll_group_t* poll_group_acquire(port_state_t* port);
+WEPOLL_INTERNAL void poll_group_release(poll_group_t* poll_group);
+
+WEPOLL_INTERNAL void poll_group_delete(poll_group_t* poll_group);
+
+WEPOLL_INTERNAL poll_group_t* poll_group_from_queue_node(
+    queue_node_t* queue_node);
+WEPOLL_INTERNAL HANDLE
+    poll_group_get_afd_helper_handle(poll_group_t* poll_group);
+
+typedef struct queue_node {
+  queue_node_t* prev;
+  queue_node_t* next;
+} queue_node_t;
+
+typedef struct queue {
+  queue_node_t head;
+} queue_t;
+
+WEPOLL_INTERNAL void queue_init(queue_t* queue);
+WEPOLL_INTERNAL void queue_node_init(queue_node_t* node);
+
+WEPOLL_INTERNAL queue_node_t* queue_first(const queue_t* queue);
+WEPOLL_INTERNAL queue_node_t* queue_last(const queue_t* queue);
+
+WEPOLL_INTERNAL void queue_prepend(queue_t* queue, queue_node_t* node);
+WEPOLL_INTERNAL void queue_append(queue_t* queue, queue_node_t* node);
+WEPOLL_INTERNAL void queue_move_first(queue_t* queue, queue_node_t* node);
+WEPOLL_INTERNAL void queue_move_last(queue_t* queue, queue_node_t* node);
+WEPOLL_INTERNAL void queue_remove(queue_node_t* node);
+
+WEPOLL_INTERNAL bool queue_empty(const queue_t* queue);
+WEPOLL_INTERNAL bool queue_enqueued(const queue_node_t* node);
 
 static const size_t POLL_GROUP__MAX_GROUP_SIZE = 32;
 
@@ -1041,6 +1029,31 @@ void poll_group_release(poll_group_t* poll_group) {
 
   /* Poll groups are currently only freed when the epoll port is closed. */
 }
+
+WEPOLL_INTERNAL sock_state_t* sock_new(port_state_t* port_state,
+                                       SOCKET socket);
+WEPOLL_INTERNAL void sock_delete(port_state_t* port_state,
+                                 sock_state_t* sock_state);
+WEPOLL_INTERNAL void sock_force_delete(port_state_t* port_state,
+                                       sock_state_t* sock_state);
+
+WEPOLL_INTERNAL int sock_set_event(port_state_t* port_state,
+                                   sock_state_t* sock_state,
+                                   const struct epoll_event* ev);
+
+WEPOLL_INTERNAL int sock_update(port_state_t* port_state,
+                                sock_state_t* sock_state);
+WEPOLL_INTERNAL int sock_feed_event(port_state_t* port_state,
+                                    IO_STATUS_BLOCK* io_status_block,
+                                    struct epoll_event* ev);
+
+WEPOLL_INTERNAL sock_state_t* sock_state_from_queue_node(
+    queue_node_t* queue_node);
+WEPOLL_INTERNAL queue_node_t* sock_state_to_queue_node(
+    sock_state_t* sock_state);
+WEPOLL_INTERNAL sock_state_t* sock_state_from_tree_node(
+    tree_node_t* tree_node);
+WEPOLL_INTERNAL tree_node_t* sock_state_to_tree_node(sock_state_t* sock_state);
 
 #define PORT__MAX_ON_STACK_COMPLETIONS 256
 
@@ -1190,10 +1203,11 @@ static int port__feed_events(port_state_t* port_state,
   DWORD i;
 
   for (i = 0; i < iocp_event_count; i++) {
-    OVERLAPPED* overlapped = iocp_events[i].lpOverlapped;
+    IO_STATUS_BLOCK* io_status_block =
+        (IO_STATUS_BLOCK*) iocp_events[i].lpOverlapped;
     struct epoll_event* ev = &epoll_events[epoll_event_count];
 
-    epoll_event_count += sock_feed_event(port_state, overlapped, ev);
+    epoll_event_count += sock_feed_event(port_state, io_status_block, ev);
   }
 
   return epoll_event_count;
@@ -1588,7 +1602,7 @@ typedef enum sock__poll_status {
 } sock__poll_status_t;
 
 typedef struct sock_state {
-  OVERLAPPED overlapped;
+  IO_STATUS_BLOCK io_status_block;
   AFD_POLL_INFO poll_info;
   queue_node_t queue_node;
   tree_node_t tree_node;
@@ -1613,16 +1627,11 @@ static inline void sock__free(sock_state_t* sock_state) {
 }
 
 static int sock__cancel_poll(sock_state_t* sock_state) {
-  HANDLE afd_helper_handle =
-      poll_group_get_afd_helper_handle(sock_state->poll_group);
   assert(sock_state->poll_status == SOCK__POLL_PENDING);
 
-  /* CancelIoEx() may fail with ERROR_NOT_FOUND if the overlapped operation has
-   * already completed. This is not a problem and we proceed normally. */
-  if (!HasOverlappedIoCompleted(&sock_state->overlapped) &&
-      !CancelIoEx(afd_helper_handle, &sock_state->overlapped) &&
-      GetLastError() != ERROR_NOT_FOUND)
-    return_map_error(-1);
+  if (afd_cancel_poll(poll_group_get_afd_helper_handle(sock_state->poll_group),
+                      &sock_state->io_status_block) < 0)
+    return -1;
 
   sock_state->poll_status = SOCK__POLL_CANCELLED;
   sock_state->pending_events = 0;
@@ -1799,11 +1808,9 @@ int sock_update(port_state_t* port_state, sock_state_t* sock_state) {
     sock_state->poll_info.Handles[0].Events =
         sock__epoll_events_to_afd_events(sock_state->user_events);
 
-    memset(&sock_state->overlapped, 0, sizeof sock_state->overlapped);
-
     if (afd_poll(poll_group_get_afd_helper_handle(sock_state->poll_group),
                  &sock_state->poll_info,
-                 &sock_state->overlapped) < 0) {
+                 &sock_state->io_status_block) < 0) {
       switch (GetLastError()) {
         case ERROR_IO_PENDING:
           /* Overlapped poll operation in progress; this is expected. */
@@ -1831,10 +1838,10 @@ int sock_update(port_state_t* port_state, sock_state_t* sock_state) {
 }
 
 int sock_feed_event(port_state_t* port_state,
-                    OVERLAPPED* overlapped,
+                    IO_STATUS_BLOCK* io_status_block,
                     struct epoll_event* ev) {
   sock_state_t* sock_state =
-      container_of(overlapped, sock_state_t, overlapped);
+      container_of(io_status_block, sock_state_t, io_status_block);
   AFD_POLL_INFO* poll_info = &sock_state->poll_info;
   uint32_t epoll_events = 0;
 
@@ -1845,10 +1852,10 @@ int sock_feed_event(port_state_t* port_state,
     /* Socket has been deleted earlier and can now be freed. */
     return sock__delete(port_state, sock_state, false);
 
-  } else if ((NTSTATUS) overlapped->Internal == STATUS_CANCELLED) {
+  } else if (io_status_block->Status == STATUS_CANCELLED) {
     /* The poll request was cancelled by CancelIoEx. */
 
-  } else if (!NT_SUCCESS(overlapped->Internal)) {
+  } else if (!NT_SUCCESS(io_status_block->Status)) {
     /* The overlapped request itself failed in an unexpected way. */
     epoll_events = EPOLLERR;
 
