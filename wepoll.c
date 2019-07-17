@@ -29,11 +29,9 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#ifndef WEPOLL_EXPORT
-#define WEPOLL_EXPORT
-#endif
-
 #include <stdint.h>
+
+#define WEPOLL_EXPORT
 
 enum EPOLL_EVENTS {
   EPOLLIN      = (int) (1U <<  0),
@@ -645,7 +643,7 @@ int epoll_ctl(HANDLE ephnd, int op, SOCKET sock, struct epoll_event* ev) {
   return 0;
 
 err:
-  /* On Linux, in the case of epoll_ctl_mod(), EBADF takes priority over other
+  /* On Linux, in the case of epoll_ctl(), EBADF takes priority over other
    * errors. Wepoll mimics this behavior. */
   err_check_handle(ephnd);
   err_check_handle((HANDLE) sock);
