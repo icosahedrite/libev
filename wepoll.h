@@ -32,11 +32,9 @@
 #ifndef WEPOLL_H_
 #define WEPOLL_H_
 
-#ifndef WEPOLL_EXPORT
-#define WEPOLL_EXPORT
-#endif
-
 #include <stdint.h>
+
+#define WEPOLL_EXPORT
 
 enum EPOLL_EVENTS {
   EPOLLIN      = (int) (1U <<  0),
