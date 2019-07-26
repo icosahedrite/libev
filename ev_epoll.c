@@ -64,7 +64,7 @@
  */
 
 #ifdef _WIN32
-#include "wepoll.h"
+#include <wepoll.h>
 #else
 #include <sys/epoll.h>
 #endif
@@ -257,7 +257,7 @@ epoll_epoll_create (void)
       fd = epoll_create (256);
 
       if (fd >= 0)
-        fcntl (fd, F_SETFD, FD_CLOEXEC);
+        fcntl (fd, FD_CLOSE);
     }
 
   return fd;
