@@ -292,7 +292,11 @@ ecb_cold
 static void
 epoll_fork (EV_P)
 {
+#ifdef _WIN32
+  epoll_close (backend_fd);
+#else
   close (backend_fd);
+#endif
 
   while ((backend_fd = epoll_epoll_create ()) < 0)
     ev_syserr ("(libev) epoll_create");
