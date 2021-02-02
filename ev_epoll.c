@@ -63,7 +63,11 @@
  * file descriptors.
  */
 
+#ifdef _WIN32
+#include "wepoll.h"
+#else
 #include <sys/epoll.h>
+#endif
 
 #define EV_EMASK_EPERM 0x80
 
